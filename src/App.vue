@@ -4,6 +4,7 @@ import type { Frame } from './timeline'
 import { timeline, reorder, remove } from './timeline'
 import { store, type StoredFrame } from './store'
 import { capture } from './capture'
+import { IntervalTimer } from './interval'
 import { mp4, webm, framesZip, supportedMP4 } from './export'
 const frames = ref<Frame[]>([]), fps = ref(12), selected = ref(-1), playhead = ref(-1)
 const thumbs = ref<Record<string, string>>({}), camera = ref<HTMLVideoElement | null>(null)
@@ -22,7 +23,9 @@ function openMovie() { settings.value = false; framePanel.value = false; mobileP
 function openSettings() { mobilePanel.value = false; framePanel.value = false; settings.value = !settings.value }
 function openFrame() { mobilePanel.value = false; settings.value = false; framePanel.value = true }
 function closePanels() { mobilePanel.value = false; framePanel.value = false; settings.value = false }
-let wake: WakeLockSentinel | null = null, timer: ReturnType<typeof setTimeout> | null = null, playbackTimer: ReturnType<typeof setTimeout> | null = null
+let wake: WakeLockSentinel | null = null, playbackTimer: ReturnType<typeof setTimeout> | null = null
+const intervalTimer = new IntervalTimer()
+let intervalGeneration = 0
 let controller: AbortController | null = null, resultUrl: string | null = null
 let undoState: { order: Frame[]; deleted?: StoredFrame[]; selected: number } | null = null
 const timing = computed(() => timeline(frames.value, fps.value))
@@ -57,15 +60,18 @@ async function focus(event: MouseEvent) {
     } catch { /* visual feedback still confirms the tap */ }
   }
 }
-async function shoot() {
-  if (!canCapture.value || !camera.value) return
+async function shoot(signal?: AbortSignal) {
+  if (!canCapture.value || !camera.value || signal?.aborted || (running.value && !signal)) return
   busy.value = true; flash.value = true; setTimeout(() => flash.value = false, 90)
   navigator.vibrate?.(25)
   try {
     const { blob, thumb, width, height } = await capture(camera.value)
+    if (signal?.aborted) return
     if (frames.value.length && (frames.value[0].width !== width || frames.value[0].height !== height)) { error.value = 'Camera resolution changed. Start a new project to keep one export size.'; return }
     const frame: Frame = { id: crypto.randomUUID(), hold: 1, width, height }
-    await store.put({ ...frame, blob, thumb }); thumbs.value[frame.id] = urlFor(thumb)
+    await store.put({ ...frame, blob, thumb })
+    if (signal?.aborted) { await store.deleteFrame(frame.id); return }
+    thumbs.value[frame.id] = urlFor(thumb)
     frames.value.push(frame); selected.value = frames.value.length - 1; await persist()
   } catch (e) { error.value = String(e) } finally { busy.value = false }
 }
@@ -125,24 +131,31 @@ async function clearProject() {
   stopInterval(); stopPlayback(); controller?.abort(); await store.clear(); Object.keys(thumbs.value).forEach(discardUrl)
   frames.value = []; selected.value = -1; keyframe.value = null; undoState = null; notice.value = `Deleted the project and ${count} stored frame${count === 1 ? '' : 's'}.`
 }
-async function lockScreen() {
+async function lockScreen(generation: number) {
   wakeHint.value = ''
-  try { if ('wakeLock' in navigator) wake = await navigator.wakeLock.request('screen'); else wakeHint.value = 'Screen wake lock unavailable; keep your screen awake.' }
-  catch { wakeHint.value = 'Screen wake lock unavailable; keep your screen awake.' }
+  try {
+    if (!('wakeLock' in navigator)) { wakeHint.value = 'Screen wake lock unavailable; keep your screen awake.'; return }
+    const acquired = await navigator.wakeLock.request('screen')
+    if (running.value && generation === intervalGeneration) wake = acquired
+    else await acquired.release()
+  } catch { if (running.value && generation === intervalGeneration) wakeHint.value = 'Screen wake lock unavailable; keep your screen awake.' }
 }
-function stopInterval() { running.value = false; countdown.value = 0; if (timer) clearTimeout(timer); timer = null; wake?.release(); wake = null }
-function intervalStep() {
-  if (!running.value) return
-  countdown.value = interval.value
-  const step = async () => {
-    if (!running.value) return
-    countdown.value--
-    if (countdown.value <= 0) { await shoot(); if (running.value) intervalStep() }
-    else timer = setTimeout(step, 1000)
-  }
-  timer = setTimeout(step, 1000)
+function stopInterval() {
+  intervalGeneration++
+  running.value = false
+  countdown.value = 0
+  intervalTimer.stop()
+  if (wake) { void wake.release().catch(() => {}); wake = null }
 }
-async function toggleInterval() { if (running.value) { stopInterval(); return } if (!canCapture.value || !interval.value) return; running.value = true; await lockScreen(); intervalStep() }
+async function toggleInterval() {
+  if (running.value) { stopInterval(); return }
+  if (!canCapture.value || !interval.value) return
+  running.value = true
+  const generation = ++intervalGeneration
+  await lockScreen(generation)
+  if (!running.value || generation !== intervalGeneration) return
+  intervalTimer.start(interval.value, remaining => { countdown.value = remaining }, signal => shoot(signal))
+}
 function stopPlayback() { playing.value = false; playhead.value = -1; if (playbackTimer) clearTimeout(playbackTimer); if (playbackUrl.value) URL.revokeObjectURL(playbackUrl.value); playbackUrl.value = '' }
 function play() {
   if (playing.value) { stopPlayback(); return }
@@ -182,8 +195,27 @@ function keydown(event: KeyboardEvent) { if (event.code === 'Escape') closePanel
 watch(fps, () => { void persist() })
 watch([() => frames.value[0]?.width, () => frames.value[0]?.height], async () => { if (frames.value.length) mp4Available.value = await supportedMP4(frames.value[0].width, frames.value[0].height) }, { immediate: true })
 onMounted(async () => {
-  try { const saved = await store.load(); if (saved) { fps.value = saved.fps; frames.value = saved.order; for (const frame of saved.order) { const stored = await store.get(frame.id); if (stored) thumbs.value[frame.id] = urlFor(stored.thumb) } selected.value = frames.value.length - 1 } }
-  catch (e) { error.value = `Could not open saved project: ${e}` }
+  try {
+    const saved = await store.load()
+    if (saved) { fps.value = saved.fps; frames.value = saved.order }
+    const known = new Set(frames.value.map(frame => frame.id))
+    // Older versions could save a JPEG before failing to save its reactive timeline.
+    // Recover those blobs without decoding every full-resolution image into memory.
+    const missing = (await store.ids()).filter(id => !known.has(id))
+    for (const id of missing) {
+      const stored = await store.get(id)
+      if (stored) frames.value.push({ id: stored.id, hold: stored.hold, width: stored.width, height: stored.height })
+    }
+    for (const frame of frames.value) {
+      const stored = await store.get(frame.id)
+      if (stored) thumbs.value[frame.id] = urlFor(stored.thumb)
+    }
+    if (missing.length) {
+      await persist()
+      notice.value = `Recovered ${missing.length} photo${missing.length === 1 ? '' : 's'} from storage. Check their order.`
+    }
+    selected.value = frames.value.length - 1
+  } catch (e) { error.value = `Could not open saved project: ${e}` }
   if ('mediaDevices' in navigator && navigator.mediaDevices) await startCamera(); else cameraError.value = 'Camera unavailable in this browser. Import photos to start.'
   window.addEventListener('keydown', keydown)
 })
@@ -218,7 +250,8 @@ onUnmounted(() => { stopInterval(); stopPlayback(); stream.value?.getTracks().fo
           <div v-if="focusing && stream" class="focus-ring" :style="{ left: `${focusPosition.x}%`, top: `${focusPosition.y}%` }"></div>
           <div v-if="flash" class="flash"></div>
           <div class="viewfinder-top"><span class="live-badge"><i></i>{{ playing ? 'PLAYBACK' : stream ? 'LIVE' : 'NO CAMERA' }}</span><span class="viewfinder-resolution">{{ stream && camera?.videoWidth ? `${camera.videoWidth} × ${camera.videoHeight}` : resolution }}</span></div>
-          <div v-if="running" class="countdown">{{ countdown }}<span>NEXT FRAME</span></div>
+          <div v-if="running" class="countdown">{{ busy ? '●' : countdown }}<span>{{ busy ? 'CAPTURING' : 'NEXT FRAME' }}</span></div>
+          <button v-if="running" class="interval-stop" type="button" @click.stop="stopInterval">■ Stop timer</button>
           <div class="viewfinder-bottom"><span>FRAME {{ String(playing ? playhead + 1 : frames.length + 1).padStart(3, '0') }}</span><span>{{ front ? 'FRONT · MIRRORED PREVIEW' : 'BACK CAMERA' }}</span></div>
         </div>
         <div class="camera-tools">
@@ -256,8 +289,8 @@ onUnmounted(() => { stopInterval(); stopPlayback(); stream.value?.getTracks().fo
 
     <section class="bottom-dock">
       <div class="timeline-header"><div><span class="eyebrow">TIMELINE</span><span class="timeline-caption">{{ frames.length ? ` ${frames.length} frames · ${timing.durationFrames} held frames` : ' Your story starts with one frame' }}</span><span class="mobile-timeline-count">{{ frames.length }} frames · {{ timing.durationSeconds.toFixed(1) }}s</span></div><div class="timeline-actions"><button class="quiet" :disabled="!undoState" @click="undo">↶ Undo</button><button class="quiet" :disabled="!frames.length" @click="loop = !loop">Loop {{ loop ? 'on' : 'off' }}</button><button class="quiet" :disabled="!frames.length" @click="clearTimeline">Clear frames</button><button class="quiet danger" @click="clearProject">Delete project</button></div><div class="mobile-timeline-actions"><button class="mobile-undo-button" :disabled="!undoState" @click="undo">↶ Undo</button><button class="mobile-edit-button" :disabled="!current" @click="openFrame">Edit frame ↗</button></div></div>
-      <div class="strip" aria-label="Frame timeline"><button v-if="!frames.length" class="empty-frame" @click="shoot">＋<span>First frame</span></button><button v-for="(frame, index) in frames" :key="frame.id" class="frame-tile" :class="{ selected: selected === index, playing: playhead === index }" draggable="true" @dragstart="dragged = index" @dragend="dragged = -1" @dragover.prevent @drop.prevent="dropAt(index)" @click="selected = index" :aria-label="`Frame ${index + 1}, hold ${frame.hold}`"><img :src="thumbs[frame.id]" alt=""><span class="tile-number">{{ String(index + 1).padStart(2, '0') }}</span><span v-if="frame.hold > 1" class="tile-hold">×{{ frame.hold }}</span><span v-if="keyframe === frame.id" class="tile-key">KEY</span></button></div>
-      <div class="dock-controls"><div class="frame-edit"><span class="selection-text">{{ current ? `FRAME ${String(selected + 1).padStart(2, '0')} / ${String(frames.length).padStart(2, '0')}` : 'NO FRAME SELECTED' }}</span><div v-if="current" class="edit-buttons"><label>Hold <select :value="current.hold" @change="setHold(Number(($event.target as HTMLSelectElement).value))"><option v-for="n in 9" :key="n" :value="n">{{ n }}×</option></select></label><button class="quiet" @click="keyframe = keyframe === current.id ? null : current.id">{{ keyframe === current.id ? 'Unpin key' : 'Pin key' }}</button><button class="quiet" @click="duplicate">Duplicate</button><button class="quiet danger" @click="deleteSelected">Delete</button></div></div><div class="transport"><button class="play-button" :disabled="!frames.length" @click="play">{{ playing ? '■ Stop' : '▶ Play' }}</button><button class="shutter" :disabled="!canCapture" aria-label="Capture frame" @click="shoot"><span></span></button><span class="shutter-label">CAPTURE FRAME <small>SPACE BAR</small></span><button class="mobile-onion" :class="{ active: onion }" :aria-pressed="onion" @click="onion = !onion">◐<span>Onion {{ onion ? 'on' : 'off' }}</span></button></div></div>
+      <div class="strip" aria-label="Frame timeline"><button v-if="!frames.length" class="empty-frame" @click="shoot()">＋<span>First frame</span></button><button v-for="(frame, index) in frames" :key="frame.id" class="frame-tile" :class="{ selected: selected === index, playing: playhead === index }" draggable="true" @dragstart="dragged = index" @dragend="dragged = -1" @dragover.prevent @drop.prevent="dropAt(index)" @click="selected = index" :aria-label="`Frame ${index + 1}, hold ${frame.hold}`"><img :src="thumbs[frame.id]" alt=""><span class="tile-number">{{ String(index + 1).padStart(2, '0') }}</span><span v-if="frame.hold > 1" class="tile-hold">×{{ frame.hold }}</span><span v-if="keyframe === frame.id" class="tile-key">KEY</span></button></div>
+      <div class="dock-controls"><div class="frame-edit"><span class="selection-text">{{ current ? `FRAME ${String(selected + 1).padStart(2, '0')} / ${String(frames.length).padStart(2, '0')}` : 'NO FRAME SELECTED' }}</span><div v-if="current" class="edit-buttons"><label>Hold <select :value="current.hold" @change="setHold(Number(($event.target as HTMLSelectElement).value))"><option v-for="n in 9" :key="n" :value="n">{{ n }}×</option></select></label><button class="quiet" @click="keyframe = keyframe === current.id ? null : current.id">{{ keyframe === current.id ? 'Unpin key' : 'Pin key' }}</button><button class="quiet" @click="duplicate">Duplicate</button><button class="quiet danger" @click="deleteSelected">Delete</button></div></div><div class="transport"><button class="play-button" :disabled="!frames.length" @click="play">{{ playing ? '■ Stop' : '▶ Play' }}</button><button class="shutter" :disabled="!canCapture || running" aria-label="Capture frame" @click="shoot()"><span></span></button><span class="shutter-label">CAPTURE FRAME <small>SPACE BAR</small></span><button class="mobile-onion" :class="{ active: onion }" :aria-pressed="onion" @click="onion = !onion">◐<span>Onion {{ onion ? 'on' : 'off' }}</span></button></div></div>
     </section>
 
     <div v-if="mobilePanel || framePanel || settings" class="sheet-scrim" @click="closePanels"></div>
